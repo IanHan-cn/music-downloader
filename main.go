@@ -108,7 +108,15 @@ func main() {
 
 	// 1. 创建一个多路复用器（路由器）
 	mux := http.NewServeMux()
-	// 2. 注册 POST 接口（接收 JSON 参数）
+
+	// 2. 注册健康检查接口（供容器 HEALTHCHECK 使用）
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(Response{Code: 200, Message: "ok"})
+	})
+
+	// 3. 注册 POST 接口（接收 JSON 参数）
 	mux.HandleFunc("POST /modify/flac", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -150,7 +158,7 @@ func main() {
 		}
 	})
 
-	// 3. 启动服务，监听 8080 端口
+	// 4. 启动服务，监听 8080 端口
 	slog.Info("启动服务...")
 	slog.Info("Server is running on http://localhost:8080...")
 	if err := http.ListenAndServe(":8080", mux); err != nil {

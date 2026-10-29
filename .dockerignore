@@ -1,0 +1,27 @@
+# 版本控制与 CI 配置
+.git
+.github
+.gitignore
+
+# 本地密钥与配置，禁止打进镜像
+.env
+.env.*
+!.env.example
+*.local
+
+# 构建产物
+bin/
+dist/
+build/
+vendor/
+
+# 日志与临时文件
+*.log
+tmp/
+temp/
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+*.swp
+.DS_Store
