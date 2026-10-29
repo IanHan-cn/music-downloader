@@ -104,5 +104,7 @@ jobs:
         env:
           COSIGN_EXPERIMENTAL: "1"
         run: |
-          cosign sign --yes \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          # 方式一：遍历标签进行签名（推荐，会为每一个生成的 Tag / 镜像清单进行签名）
+          for tag in ${{ steps.meta.outputs.tags }}; do
+            cosign sign --yes "$tag"
+          done
