@@ -98,6 +98,18 @@ func initR2() (*s3.Client, error) {
 	return s3Client, nil
 }
 
+// AuthMiddleware 鉴权中间件
+func AuthMiddleware(expectedToken string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := r.Header.Get("Authorization")
+		if strings.TrimSpace(expectedToken) != "" && token != "Bearer "+expectedToken {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// 校验通过，执行真正的 Handler
+		next(w, r)
+	}
+}
 func main() {
 	godotenv.Load()
 	initLog()
@@ -117,7 +129,7 @@ func main() {
 	})
 
 	// 3. 注册 POST 接口（接收 JSON 参数）
-	mux.HandleFunc("POST /modify/flac", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /modify/flac", AuthMiddleware(os.Getenv("HEADERS_TOKEN"), func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
 		// 解析请求体中的 JSON
@@ -156,7 +168,7 @@ func main() {
 			w.WriteHeader(http.StatusAccepted)
 			json.NewEncoder(w).Encode(resp)
 		}
-	})
+	}))
 
 	// 4. 启动服务，监听 8080 端口
 	slog.Info("启动服务...")
