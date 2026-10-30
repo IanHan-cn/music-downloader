@@ -149,6 +149,8 @@ func (basics BucketBasics) UploadLargeObject(ctx context.Context, bucketName str
 	var partMiBs int64 = 10
 	uploader := manager.NewUploader(basics.S3Client, func(u *manager.Uploader) {
 		u.PartSize = partMiBs * 1024 * 1024
+		// 分片上传并发数，默认为 5，这里显式放大以提升大文件吞吐
+		u.Concurrency = 10
 	})
 	_, err := uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucketName),

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -21,6 +22,7 @@ import (
 	"github.com/go-flac/go-flac"
 	"github.com/joho/godotenv"
 
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -49,6 +51,31 @@ type Response struct {
 
 var (
 	ErrResponseCode = errors.New("请求返回异常")
+)
+
+// sharedTransport 全局共享的连接池：所有出站请求复用同一批 TCP/TLS 连接，
+// 避免每个请求重建连接时的握手开销（默认的 MaxIdleConnsPerHost 只有 2）
+var sharedTransport = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          1000, // 全局空闲连接总数
+	MaxIdleConnsPerHost:   100,  // 每个 host 保留的空闲连接数
+	MaxConnsPerHost:       100,  // 每个 host 的最大并发连接数，0 为不限制
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	ResponseHeaderTimeout: 30 * time.Second,
+}
+
+var (
+	// downloadClient 用于下载 FLAC/封面等可能较大的文件，整体超时放宽
+	downloadClient = &http.Client{Transport: sharedTransport, Timeout: 5 * time.Minute}
+	// apiClient 用于歌词等轻量 API 请求，快速失败
+	apiClient = &http.Client{Transport: sharedTransport, Timeout: 15 * time.Second}
 )
 
 // 定义不安全字符的正则表达式：
@@ -105,6 +132,21 @@ func initR2() (*s3.Client, error) {
 		return nil, err
 	}
 
+	// 自定义底层 HTTP 客户端，放大连接池容量，避免上传时被默认配置节流
+	cfg.HTTPClient = awshttp.NewBuildableClient().
+		WithTimeout(120 * time.Second).
+		WithDialerOptions(func(d *net.Dialer) {
+			d.Timeout = 10 * time.Second
+			d.KeepAlive = 30 * time.Second
+		}).
+		WithTransportOptions(func(tr *http.Transport) {
+			tr.MaxIdleConns = 1000
+			tr.MaxIdleConnsPerHost = 100
+			tr.MaxConnsPerHost = 100
+			tr.TLSHandshakeTimeout = 10 * time.Second
+			tr.ResponseHeaderTimeout = 30 * time.Second
+		})
+
 	s3Client := s3.NewFromConfig(cfg)
 	return s3Client, nil
 }
@@ -145,10 +187,19 @@ func main() {
 	mux.HandleFunc("POST /modify/flac", AuthMiddleware(os.Getenv("HEADERS_TOKEN"), func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
+		// 限制请求体大小（1MB），避免超大 body 长时间占用连接与内存
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
 		// 解析请求体中的 JSON
 		var f FileInfo
 		err := json.NewDecoder(r.Body).Decode(&f)
 		if err != nil {
+			var mbErr *http.MaxBytesError
+			if errors.As(err, &mbErr) {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				json.NewEncoder(w).Encode(Response{Code: 413, Message: "Request body too large"})
+				return
+			}
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(Response{Code: 400, Message: "Invalid request body"})
 			return
@@ -157,7 +208,7 @@ func main() {
 		f.Artist = sanitizeFileName(f.Artist)
 		f.Album = sanitizeFileName(f.Album)
 
-		if url, err := run(f, r2Client); err != nil {
+		if url, err := run(r.Context(), f, r2Client); err != nil {
 			slog.Error("处理请求时出错", "error", err)
 			if errors.Is(err, ErrResponseCode) {
 				w.WriteHeader(http.StatusBadRequest)
@@ -184,9 +235,18 @@ func main() {
 	}))
 
 	// 4. 启动服务，监听 8080 端口
+	server := &http.Server{
+		Addr:              ":8080",
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 	slog.Info("启动服务...")
 	slog.Info("Server is running on http://localhost:8080...")
-	if err := http.ListenAndServe(":8080", mux); err != nil {
+	if err := server.ListenAndServe(); err != nil {
 		slog.Error("Server failed to start", "error", err)
 	}
 
@@ -196,19 +256,18 @@ func main() {
 	// }
 }
 
-func run(f FileInfo, r2Client *s3.Client) (*string, error) {
+func run(ctx context.Context, f FileInfo, r2Client *s3.Client) (*string, error) {
 	outputPath := f.Title + "-" + f.Artist + ".flac"
-	// 全局复用 client，避免频繁创建和关闭连接
-	client := &http.Client{
-		Timeout: 30 * time.Second, // 30 秒超时
-	}
-	flacFile, err := downloadFile(client, f.FileURL)
+	flacFile, err := downloadFile(ctx, downloadClient, f.FileURL)
 	if err != nil {
 		return nil, fmt.Errorf("FileURL 下载失败: %w", err)
 	}
-
-	lyrics, _ := downloadLyrics(client, f)
-
+	var lyrics string
+	if os.Getenv("SCRAPE_LYRICS") == "true" {
+		lyrics, _ = downloadLyrics(ctx, f)
+	} else {
+		lyrics = ""
+	}
 	flacFileParsed, err := parseFlacFile(bytes.NewReader(flacFile), f, lyrics)
 	if err != nil {
 		return nil, err
@@ -222,7 +281,7 @@ func run(f FileInfo, r2Client *s3.Client) (*string, error) {
 	if coverUrl != "" {
 		slog.Debug("开始下载封面...")
 		// 下载封面
-		imgData, err := downloadFile(client, coverUrl)
+		imgData, err := downloadFile(ctx, downloadClient, coverUrl)
 		if err != nil {
 			// 允许没有图片
 			// return nil, fmt.Errorf("CoverURL 下载失败: %w", err)
@@ -272,15 +331,18 @@ func putToR2(flacObject []byte, outputPath string, r2Client *s3.Client) (*string
 	)
 	return &downloadUrl.URL, err
 }
-func downloadLyrics(client *http.Client, fInfo FileInfo) (string, error) {
+func downloadLyrics(ctx context.Context, fInfo FileInfo) (string, error) {
 	info := lrclib.RequestInfo{
 		Album:    fInfo.Album,
 		Artist:   fInfo.Artist,
 		Duration: fInfo.Duration,
 		Title:    fInfo.Title,
 	}
-	lrcQ := lrclib.NewLyricsRequest(client, &info)
-	lrc, err := lrcQ.GetLyricsWithRetry()
+	lrcQ := lrclib.NewLyricsRequest(apiClient, &info)
+	// 歌词属于锦上添花的内容，给一个独立上限，避免拖慢整体流程
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	lrc, err := lrcQ.GetLyricsWithRetry(ctx)
 	// 允许无歌词,只做 log 记录
 	if err != nil {
 		slog.Error(" http请求获取歌词失败", "error", err)
@@ -297,9 +359,13 @@ func downloadLyrics(client *http.Client, fInfo FileInfo) (string, error) {
 		return "", nil
 	}
 }
-func downloadFile(client *http.Client, url string) ([]byte, error) {
+func downloadFile(ctx context.Context, client *http.Client, url string) ([]byte, error) {
 	slog.Debug("开始下载文件...", "url", url)
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		slog.Error("请求失败或超时", "error", err)
 		return nil, err

@@ -1,14 +1,24 @@
 package lrclib
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"time"
+)
+
+// 退避重试相关参数：整体等待时间受 maxTotalWait 限制，避免高并发时大量 goroutine 长时间阻塞
+const (
+	maxRetries     = 3
+	baseDelay      = 200 * time.Millisecond
+	maxSingleDelay = 1 * time.Second
+	maxTotalWait   = 3 * time.Second
 )
 
 // LyricsResponse 定义 LRCLIB 返回的歌词 JSON 数据结构
@@ -41,7 +51,8 @@ func NewLyricsRequest(client *http.Client, rInfo *RequestInfo) *lyricsRequest {
 }
 
 // GetLyricsWithRetry 带退阶重试（Exponential Backoff）的歌词请求函数
-func (l *lyricsRequest) GetLyricsWithRetry() (*LyricsResponse, error) {
+// ctx 取消或超时会立即中断重试等待
+func (l *lyricsRequest) GetLyricsWithRetry(ctx context.Context) (*LyricsResponse, error) {
 	// 参数：
 	//   - trackName: 曲名（必填）
 	//   - artistName: 艺术家/歌手名（必填）
@@ -69,13 +80,11 @@ func (l *lyricsRequest) GetLyricsWithRetry() (*LyricsResponse, error) {
 
 	client := l.client
 
-	maxRetries := 5
-	baseDelay := 1 * time.Second
-
 	var lastErr error
+	var waited time.Duration
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		req, err := http.NewRequest("GET", reqURL, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		if err != nil {
 			return nil, fmt.Errorf("创建请求失败: %w", err)
 		}
@@ -112,21 +121,36 @@ func (l *lyricsRequest) GetLyricsWithRetry() (*LyricsResponse, error) {
 			}
 		}
 
-		// 如果已经是最后一次尝试，则跳出循环返回错误
-		if attempt == maxRetries {
+		// 已经是最后一次尝试或已耗尽等待预算，则跳出循环返回错误
+		remaining := maxTotalWait - waited
+		if attempt == maxRetries || remaining <= 0 {
 			break
 		}
 
-		// 计算退阶延迟时间：baseDelay * 2^attempt，并加入随机抖动防止惊群效应
-		multiplier := math.Pow(2, float64(attempt))
-		sleepDuration := time.Duration(float64(baseDelay) * multiplier)
+		// 计算退阶延迟时间：baseDelay * 2^attempt，单次上限 maxSingleDelay
+		sleepDuration := time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt)))
+		if sleepDuration > maxSingleDelay {
+			sleepDuration = maxSingleDelay
+		}
 
-		// 加上 0~500ms 的随机抖动
-		jitter := time.Duration(rand.Intn(500)) * time.Millisecond
+		// 加入 0~100ms 的随机抖动，防止惊群效应
+		jitter := time.Duration(rand.Intn(100)) * time.Millisecond
 		totalSleep := sleepDuration + jitter
+		if totalSleep > remaining {
+			totalSleep = remaining
+		}
 
-		fmt.Printf("请求遇到问题: %v。正在进行第 %d 次重试，等待 %v...\n", lastErr, attempt+1, totalSleep)
-		time.Sleep(totalSleep)
+		slog.Info("歌词请求遇到问题，准备重试",
+			"error", lastErr, "attempt", attempt+1, "wait", totalSleep.String())
+
+		timer := time.NewTimer(totalSleep)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("重试等待被中断: %w", ctx.Err())
+		case <-timer.C:
+		}
+		waited += totalSleep
 	}
 
 	return nil, fmt.Errorf("达到最大重试次数，请求失败: %w", lastErr)
