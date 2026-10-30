@@ -209,17 +209,30 @@ func run(f FileInfo, r2Client *s3.Client) (*string, error) {
 	if err != nil {
 		return nil, err
 	}
-	imgData, err := downloadFile(client, f.CoverURL)
-	if err != nil {
-		return nil, fmt.Errorf("CoverURL 下载失败: %w", err)
-	}
+	var flacObject []byte
+	flacObject = flacFileParsed.Marshal()
 
-	flacFileWithCover, err := addCoverToFlacFile(flacFileParsed, imgData)
-	if err != nil {
-		return nil, err
+	if f.CoverURL != "" {
+		slog.Debug("开始下载封面...")
+		// 下载封面
+		imgData, err := downloadFile(client, f.CoverURL)
+		if err != nil {
+			// 允许没有图片
+			// return nil, fmt.Errorf("CoverURL 下载失败: %w", err)
+			slog.Warn("CoverURL 下载失败", "error", err, "TrackName", f.Title, "ArtistName", f.Artist, "AlbumName", f.Album)
+		}
+		if imgData != nil {
+			slog.Debug("下载封面成功！")
+
+			flacFileWithCover, err := addCoverToFlacFile(flacFileParsed, imgData)
+			if err != nil {
+				return nil, err
+			}
+
+			flacObject = flacFileWithCover.Marshal()
+		}
 	}
 	// 保存到 R2
-	flacObject := flacFileWithCover.Marshal()
 	var downloadUrl *string
 	if downloadUrl, err = putToR2(flacObject, outputPath, r2Client); err != nil {
 		return nil, err
