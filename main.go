@@ -73,8 +73,12 @@ func sanitizeFileName(name string) string {
 }
 func initLog() {
 	// 1. 创建 Handler 选项并设置 Level 为 Debug
+	logLevel := slog.LevelInfo
+	if os.Getenv("DEBUG") == "true" {
+		logLevel = slog.LevelDebug
+	}
 	opts := &slog.HandlerOptions{
-		Level: slog.LevelDebug,
+		Level: logLevel,
 	}
 
 	// 2. 创建自定义的 logger（这里以 TextHandler 为例，也可以用 JSONHandler）
@@ -212,10 +216,13 @@ func run(f FileInfo, r2Client *s3.Client) (*string, error) {
 	var flacObject []byte
 	flacObject = flacFileParsed.Marshal()
 
-	if f.CoverURL != "" {
+	coverUrl := strings.TrimSpace(f.CoverURL)
+	// 去除图片 URL 中常见的压缩标志
+	coverUrl = strings.Split(coverUrl, "?")[0]
+	if coverUrl != "" {
 		slog.Debug("开始下载封面...")
 		// 下载封面
-		imgData, err := downloadFile(client, f.CoverURL)
+		imgData, err := downloadFile(client, coverUrl)
 		if err != nil {
 			// 允许没有图片
 			// return nil, fmt.Errorf("CoverURL 下载失败: %w", err)
@@ -291,6 +298,7 @@ func downloadLyrics(client *http.Client, fInfo FileInfo) (string, error) {
 	}
 }
 func downloadFile(client *http.Client, url string) ([]byte, error) {
+	slog.Debug("开始下载文件...", "url", url)
 	resp, err := client.Get(url)
 	if err != nil {
 		slog.Error("请求失败或超时", "error", err)
