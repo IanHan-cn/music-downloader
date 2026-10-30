@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	lrclib "github.com/IanHan-cn/music-downloader/LRCLIB"
 	"github.com/IanHan-cn/music-downloader/r2"
 	"github.com/go-flac/flacpicture"
 	"github.com/go-flac/flacvorbis"
@@ -25,12 +26,18 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
+const (
+	// 最大文件大小限制为 100MB
+	MAX_FILE_SIZE = 1024 * 1024 * 100
+)
+
 type FileInfo struct {
 	FileURL  string `json:"file_url"`
 	CoverURL string `json:"cover_url"`
 	Title    string `json:"title"`
 	Artist   string `json:"artist"`
 	Album    string `json:"album"`
+	Duration int    `json:"duration"`
 }
 
 // 定义返回的 JSON 数据结构
@@ -111,7 +118,9 @@ func AuthMiddleware(expectedToken string, next http.HandlerFunc) http.HandlerFun
 	}
 }
 func main() {
-	godotenv.Load()
+	if err := godotenv.Load(); err != nil {
+		slog.Warn("加载 .env 失败", "error", err)
+	}
 	initLog()
 	r2Client, err := initR2()
 	if err != nil {
@@ -194,7 +203,9 @@ func run(f FileInfo, r2Client *s3.Client) (*string, error) {
 		return nil, fmt.Errorf("FileURL 下载失败: %w", err)
 	}
 
-	flacFileParsed, err := parseFlacFile(bytes.NewReader(flacFile), f)
+	lyrics, _ := downloadLyrics(client, f)
+
+	flacFileParsed, err := parseFlacFile(bytes.NewReader(flacFile), f, lyrics)
 	if err != nil {
 		return nil, err
 	}
@@ -241,6 +252,31 @@ func putToR2(flacObject []byte, outputPath string, r2Client *s3.Client) (*string
 	)
 	return &downloadUrl.URL, err
 }
+func downloadLyrics(client *http.Client, fInfo FileInfo) (string, error) {
+	info := lrclib.RequestInfo{
+		Album:    fInfo.Album,
+		Artist:   fInfo.Artist,
+		Duration: fInfo.Duration,
+		Title:    fInfo.Title,
+	}
+	lrcQ := lrclib.NewLyricsRequest(client, &info)
+	lrc, err := lrcQ.GetLyricsWithRetry()
+	// 允许无歌词,只做 log 记录
+	if err != nil {
+		slog.Error(" http请求获取歌词失败", "error", err)
+		return "", nil
+	}
+	if lrc.SyncedLyrics != "" {
+		return lrc.SyncedLyrics, nil
+	} else if lrc.PlainLyrics != "" {
+		return lrc.PlainLyrics, nil
+	} else if lrc.Instrumental {
+		return "纯音乐", nil
+	} else {
+		slog.Info("未找到歌词", "Album", fInfo.Album, "Artist", fInfo.Artist, "Title", fInfo.Title)
+		return "", nil
+	}
+}
 func downloadFile(client *http.Client, url string) ([]byte, error) {
 	resp, err := client.Get(url)
 	if err != nil {
@@ -258,13 +294,13 @@ func downloadFile(client *http.Client, url string) ([]byte, error) {
 		return nil, err
 	}
 	// 文件体积过小的话，直接返回
-	if len(data) < 1024 {
-		return nil, fmt.Errorf("文件体积过小，可能链接已过期。")
+	if len(data) > MAX_FILE_SIZE {
+		return nil, fmt.Errorf("文件体积过大，最大允许为 %d字节,收到%d字节的文件。", MAX_FILE_SIZE, len(data))
 	}
 
 	return data, nil
 }
-func parseFlacFile(file io.Reader, f FileInfo) (*flac.File, error) {
+func parseFlacFile(file io.Reader, f FileInfo, lyrics string) (*flac.File, error) {
 	// 1. 解析 FLAC 文件
 	flacFile, err := flac.ParseBytes(file)
 	if err != nil {
@@ -296,6 +332,9 @@ func parseFlacFile(file io.Reader, f FileInfo) (*flac.File, error) {
 	_ = cmt.Add(flacvorbis.FIELD_TITLE, f.Title)
 	_ = cmt.Add(flacvorbis.FIELD_ARTIST, f.Artist)
 	_ = cmt.Add(flacvorbis.FIELD_ALBUM, f.Album)
+	if lyrics != "" {
+		_ = cmt.Add("LYRICS", lyrics)
+	}
 
 	cmtMeta := cmt.Marshal()
 	if cmtIdx >= 0 {
