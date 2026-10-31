@@ -17,6 +17,7 @@ import (
 
 	lrclib "github.com/IanHan-cn/music-downloader/LRCLIB"
 	"github.com/IanHan-cn/music-downloader/r2"
+	"github.com/IanHan-cn/music-downloader/tools"
 	"github.com/go-flac/flacpicture"
 	"github.com/go-flac/flacvorbis"
 	"github.com/go-flac/go-flac"
@@ -433,12 +434,13 @@ func parseFlacFile(file io.Reader, f FileInfo, lyrics string) (*flac.File, error
 }
 
 func addCoverToFlacFile(flacFile *flac.File, imgData []byte) (*flac.File, error) {
+	mime, err := tools.DetectImageMime(imgData)
 
 	picMeta, err := flacpicture.NewFromImageData(
 		flacpicture.PictureTypeFrontCover,
 		"Cover",
 		imgData,
-		"image/jpeg",
+		mime,
 	)
 	if err != nil {
 		slog.Error("创建封面块失败", "error", err)
