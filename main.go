@@ -47,7 +47,11 @@ func initLog() {
 	if os.Getenv("DEBUG") == "true" {
 		logLevel = slog.LevelDebug
 	}
-	opts := &slog.HandlerOptions{Level: logLevel}
+	opts := &slog.HandlerOptions{
+		Level:     logLevel,
+		AddSource: true, // 开启源码文件和行号记录
+
+	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, opts))
 	slog.SetDefault(logger)
 }
