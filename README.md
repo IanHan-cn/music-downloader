@@ -113,3 +113,31 @@ docker run --rm \
   -e HEADERS_TOKEN='<your-token>' \
   music-downloader
 ```
+
+### Workers 镜像
+
+`cmd/workers` 是处理异步任务（删除 R2 对象）的后台 worker，只消费 Redis 队列，不监听 HTTP 端口，因此使用独立的 `Dockerfile.workers`：
+
+```bash
+docker build -f Dockerfile.workers -t music-downloader-workers .
+```
+
+除上表中的 R2 配置外，还需要以下环境变量：
+
+| 环境变量 | 必需 | 说明 |
+| --- | --- | --- |
+| `REDIS_URL` | 是 | Redis 地址，形如 `<host>:6379`；worker 固定使用 DB 1 |
+| `REDIS_PASSWORD` | 否 | Redis 密码，无密码时留空 |
+
+```bash
+docker run --rm \
+  -e REDIS_URL='<redis-host>:6379' \
+  -e REDIS_PASSWORD='<redis-password>' \
+  -e R2_ENDPOINT='https://<account-id>.r2.cloudflarestorage.com' \
+  -e R2_ACCESS_KEY_ID='<your-access-key-id>' \
+  -e R2_SECRET_ACCESS_KEY='<your-secret-access-key>' \
+  -e R2BucketName='<your-bucket-name>' \
+  music-downloader-workers
+```
+
+推送 `main` 分支或 `v*` 标签时，GitHub Actions 会分别构建 HTTP 服务与 worker 的多架构镜像，并发布到 `ghcr.io/ianhan-cn/music-downloader` 与 `ghcr.io/ianhan-cn/music-downloader-workers`；拉取请求只做构建校验，不推送。
