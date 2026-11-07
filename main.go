@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/IanHan-cn/music-downloader/internal/httpapi"
@@ -24,7 +28,9 @@ func main() {
 	}
 
 	store := r2.NewStore(s3Client, os.Getenv("R2BucketName"))
-	processor := music.NewProcessor(store)
+	// 任务客户端与进程同生命周期，只创建一次，退出时统一关闭 Redis 连接池。
+	scheduler := music.NewTaskScheduler()
+	processor := music.NewProcessor(store, scheduler)
 	server := &http.Server{
 		Addr:              ":8080",
 		Handler:           httpapi.NewHandler(processor, os.Getenv("HEADERS_TOKEN")),
@@ -35,10 +41,37 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
+	// 服务错误与退出信号在主流程汇合，避免关闭逻辑与信号处理并发执行。
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- server.ListenAndServe()
+	}()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	slog.Info("启动服务...")
 	slog.Info("Server is running on http://localhost:8080...")
-	if err := server.ListenAndServe(); err != nil {
-		slog.Error("Server failed to start", "error", err)
+	// 只有在途请求全部结束后才能关闭任务客户端，否则处理中的请求会用到已关闭的连接池。
+	shutdownCompleted := true
+	select {
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("Server failed to start", "error", err)
+		}
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := server.Shutdown(shutdownCtx)
+		cancel()
+		if err != nil {
+			slog.Error("关闭 HTTP 服务失败", "error", err)
+			shutdownCompleted = false
+		}
+		<-serverErr
+	}
+	if shutdownCompleted {
+		if err := scheduler.Close(); err != nil {
+			slog.Warn("关闭任务客户端失败", "error", err)
+		}
 	}
 }
 

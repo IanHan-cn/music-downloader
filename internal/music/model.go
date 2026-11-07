@@ -20,10 +20,16 @@ type Uploader interface {
 	Upload(ctx context.Context, key string, data []byte) (string, error)
 }
 
-type Processor struct {
-	uploader Uploader
+// DeleteScheduler 负责安排临时文件的异步删除。
+type DeleteScheduler interface {
+	ScheduleDelete(key string) error
 }
 
-func NewProcessor(uploader Uploader) *Processor {
-	return &Processor{uploader: uploader}
+type Processor struct {
+	uploader  Uploader
+	scheduler DeleteScheduler
+}
+
+func NewProcessor(uploader Uploader, scheduler DeleteScheduler) *Processor {
+	return &Processor{uploader: uploader, scheduler: scheduler}
 }

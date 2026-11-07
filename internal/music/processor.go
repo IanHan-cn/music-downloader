@@ -57,7 +57,7 @@ func (p *Processor) Process(ctx context.Context, f FileInfo) (string, error) {
 		return "", err
 	}
 	// 安排删除临时文件
-	if err := Task(outputPath); err != nil {
+	if err := p.scheduler.ScheduleDelete(outputPath); err != nil {
 		return "", err
 	}
 	slog.Info("FLAC 标签与封面修改成功！")

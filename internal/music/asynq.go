@@ -9,23 +9,24 @@ import (
 	"github.com/hibiken/asynq"
 )
 
-type DeleteTaskPayload struct {
-	// S3 存储桶中的对象键
-	Key string
+// TaskScheduler 持有进程级复用的 asynq 客户端，避免每次请求都新建 Redis 连接池。
+type TaskScheduler struct {
+	client *asynq.Client
 }
 
-func Task(key string) error {
+// NewTaskScheduler 创建任务调度器，调用方需在进程退出前调用 Close 释放连接。
+func NewTaskScheduler() *TaskScheduler {
 	redisConnOpt := asynq.RedisClientOpt{
-		Addr: os.Getenv("REDIS_URL"), // Redis 服务器地址
-		// Omit if no password is required
+		Addr:     os.Getenv("REDIS_URL"),
 		Password: os.Getenv("REDIS_PASSWORD"),
-		// Use a dedicated db number for asynq.
-		// By default, Redis offers 16 databases (0..15)
-		DB: 1,
+		DB:       1,
 	}
-	client := asynq.NewClient(redisConnOpt)
-	// todo: client 需要关闭么？
-	task, err := task.NewDeleteTask(key)
+	return &TaskScheduler{client: asynq.NewClient(redisConnOpt)}
+}
+
+// ScheduleDelete 在下载链接过期后安排删除临时文件。
+func (s *TaskScheduler) ScheduleDelete(key string) error {
+	t, err := task.NewDeleteTask(key)
 	if err != nil {
 		return err
 	}
@@ -34,11 +35,16 @@ func Task(key string) error {
 	if err != nil {
 		lifeTime = 60 * time.Second
 	}
-	info, err := client.Enqueue(task, asynq.ProcessIn(lifeTime))
+	info, err := s.client.Enqueue(t, asynq.ProcessIn(lifeTime))
 	if err != nil {
 		slog.Error("创建任务失败", "error", err)
 		return err
 	}
 	slog.Debug("创建任务成功", "id", info.ID)
 	return nil
+}
+
+// Close 关闭客户端独占的 Redis 连接池。
+func (s *TaskScheduler) Close() error {
+	return s.client.Close()
 }
